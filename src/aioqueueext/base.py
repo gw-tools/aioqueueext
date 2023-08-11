@@ -11,6 +11,7 @@ class BaseQueueExt(asyncio.Queue):
     Implements common methods and initializes some properties.
     """
 
+    _aiopeek_enabled: bool
     _aiopeek_lock: asyncio.Lock
     _aiopeek_item: asyncio.Future
     _aiopeek_decider_func: t.Optional[t.Callable[[t.Any], bool]]
@@ -33,14 +34,15 @@ class BaseQueueExt(asyncio.Queue):
         return self._on_get_callback
 
     def _init(self, _maxsize: int) -> None:
+        self._aiopeek_enabled = False
         self._aiopeek_lock = asyncio.Lock()
         self._aiopeek_item = None
         self._aiopeek_decider_func = None
 
         self.__put = self._put
         self.__get = self._get
-        self._on_put_callback = None
-        self._on_get_callback = None
+        self.set_on_put_callback(None)
+        self.set_on_get_callback(None)
 
         self._empty_event = asyncio.Event()
         self._empty_event.set()
@@ -62,10 +64,6 @@ class BaseQueueExt(asyncio.Queue):
         self.__put(item)
         self._on_put_callback(item)
 
-        if self._aiopeek_lock.locked():
-            # a peeker is awaiting
-            self._aiopeek_set_result(item)
-
     def _get_with_callback(self) -> t.Any:
         self._on_get_callback(self.peek_nowait())
         return self.__get()
@@ -86,8 +84,8 @@ class BaseQueueExt(asyncio.Queue):
         while not self.full():
             await self._full_event.wait()
 
-    async def peek_and_get(self, decider: t.Callable[[t.Any], bool] = None) -> t.Any:
-        """async peek_and_get
+    async def peek_get(self, decider: t.Callable[[t.Any], bool] = None) -> t.Any:
+        """async peek_get
 
         When an item becomes available, "decider" is called with the item
         passed to it as a single positional argument. If "decider" returns
@@ -103,22 +101,26 @@ class BaseQueueExt(asyncio.Queue):
         (pop) the next item from the queue, unless it gets cancelled before an
         item is available."""
 
-        if not self.empty():
-            item = self.peek_nowait()
-            if decider is not None:
-                if decider(item):
-                    item_copy = self.get_nowait()
-                    assert item_copy is item
-            return item
-
         async with self._aiopeek_lock:
-            self._aiopeek_item = asyncio.Future()
-            self._aiopeek_decider_func = decider
+            if not self.empty():
+                item = self.peek_nowait()
+                if decider is not None:
+                    if decider(item):
+                        item_copy = self.get_nowait()
+                        assert item_copy is item
+                return item
+
+            self._enable_aiopeek()
             try:
-                await self._aiopeek_item
+                self._aiopeek_item = asyncio.get_running_loop().create_future()
+                self._aiopeek_decider_func = decider
+                try:
+                    await self._aiopeek_item
+                finally:
+                    self._aiopeek_item.cancel()
+                return self._aiopeek_item.result()
             finally:
-                self._aiopeek_item.cancel()
-            return self._aiopeek_item.result()
+                self._disable_aiopeek()
 
     def peek_nowait(self) -> t.Any:
         raise NotImplementedError
@@ -141,8 +143,49 @@ class BaseQueueExt(asyncio.Queue):
         The callback function must accept one argument which will contain the
         queued item. Called right after the item is placed into the queue.
         """
+
+        if self._aiopeek_enabled:
+            return self._set_on_put_callback_w_aiopeek(cb)
         self._on_put_callback = cb
         if cb is None:
             self._put = self.__put
         else:
             self._put = self._put_with_callback
+
+    # following are the methods utilized internally with peek_get()
+
+    def _put_wo_callback_w_aiopeek(self, item: t.Any) -> None:
+        self.__put(item)
+
+        if self._aiopeek_lock.locked() and not self._aiopeek_item.done():
+            # a peeker is awaiting
+            self._aiopeek_set_result(item)
+
+    def _put_with_callback_w_aiopeek(self, item: t.Any) -> None:
+        self.__put(item)
+        self._on_put_callback(item)
+
+        if self._aiopeek_lock.locked() and not self._aiopeek_item.done():
+            # a peeker is awaiting
+            self._aiopeek_set_result(item)
+
+    def _set_on_put_callback_w_aiopeek(
+        self, cb: t.Optional[t.Callable[[t.Any], None]]
+    ) -> None:
+        """Set a put() and put_nowait() callback function (with aiopeek)
+
+        See `set_on_put_callback()` for details.
+        """
+        self._on_put_callback = cb
+        if cb is None:
+            self._put = self._put_wo_callback_w_aiopeek
+        else:
+            self._put = self._put_with_callback_w_aiopeek
+
+    def _enable_aiopeek(self) -> None:
+        self._aiopeek_enabled = True
+        self.set_on_put_callback(self._on_put_callback)
+
+    def _disable_aiopeek(self) -> None:
+        self._aiopeek_enabled = False
+        self.set_on_put_callback(self._on_put_callback)
