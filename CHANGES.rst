@@ -1,6 +1,13 @@
 Changes
 =======
 
+0.2.1
+-----
+
+Date: 2023-08-24
+
+- Added `sync_peeking_example()` to README.
+
 0.2.0
 -----
 
